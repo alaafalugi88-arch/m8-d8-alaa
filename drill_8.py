@@ -2,55 +2,104 @@
 
 Three operational primitives for RAG: embed a sentence, verify a Weaviate
 connection, ingest a small set of objects with externally-supplied vectors.
-
-Submit by branching `drill-8-rag-basics`, opening a PR, pasting the PR URL
-into TalentLMS → Module 8 → Core Skills Drill.
 """
 
+import os
 import numpy as np
 import weaviate
+import uuid
+from sentence_transformers import SentenceTransformer
+
+# Global cache for the embedding model (loaded only once)
+_model = None
+
+
+def get_model():
+    """Load the model once and cache it."""
+    global _model
+    if _model is None:
+        _model = SentenceTransformer('all-MiniLM-L6-v2')
+    return _model
 
 
 def embed_text(text: str) -> np.ndarray:
-    """Return a 384-dim float32 numpy vector for the input string.
-
-    Use sentence-transformers' all-MiniLM-L6-v2.
-
-    Hint:
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer("all-MiniLM-L6-v2")
-        v = model.encode(text, convert_to_numpy=True).astype(np.float32)
-    """
-    # TODO: load all-MiniLM-L6-v2 (consider loading once at module level for speed)
-    # TODO: encode the text and return as float32 numpy array of shape (384,)
-    raise NotImplementedError("embed_text is not yet implemented")
+    """Return a 384-dim float32 numpy vector for the input string."""
+    model = get_model()
+    # encode returns numpy by default
+    embedding = model.encode(text, convert_to_numpy=True)
+    return embedding.astype(np.float32)
 
 
-def weaviate_ready(url: str) -> bool:
-    """Return True if Weaviate at `url` is reachable and ready, else False.
-
-    Wrap in try/except so a non-running Weaviate returns False rather than
-    raising a connection error.
-    """
-    # TODO: try weaviate.Client(url).is_ready(); return False on any exception
-    raise NotImplementedError("weaviate_ready is not yet implemented")
+def weaviate_ready(url: str = "http://localhost:8080") -> bool:
+    """Return True if Weaviate at `url` is reachable and ready, else False."""
+    try:
+        # Support environment variable for CI
+        if not url.startswith("http"):
+            url = os.environ.get("WEAVIATE_URL", url)
+        
+        client = weaviate.Client(url)
+        return client.is_ready()
+    except Exception:
+        return False
 
 
 def ingest_corpus(client: weaviate.Client, class_name: str, items: list[dict]) -> int:
-    """Ingest items into the named class. Return the count of ingested objects.
+    """Ingest items into the named class. Return the count of ingested objects."""
+    
+    # 1. Create schema if class doesn't exist
+    schema = {
+        "class": class_name,
+        "vectorizer": "none",
+        "properties": [
+            {
+                "name": "title",
+                "dataType": ["text"]
+            },
+            {
+                "name": "text",
+                "dataType": ["text"],
+                "tokenization": "word"   # for BM25
+            }
+        ]
+    }
 
-    Each item is {"title": str, "text": str, "vector": list[float]}.
+    try:
+        # Check if class exists
+        existing = client.schema.get(class_name)
+    except:
+        existing = None
 
-    If the class does not exist, create it with:
-      - properties: title (text), text (text, BM25-indexed)
-      - vectorizer: "none"
+    if not existing:
+        client.schema.create_class(schema)
+        print(f"✅ Created Weaviate class: {class_name}")
 
-    Use client.batch (or with client.batch as batch:) and remember to flush.
-    Verify the count via:
-      client.query.aggregate(class_name).with_meta_count().do()
-    """
-    # TODO: if class_name not in client.schema, create it (vectorizer "none")
-    # TODO: batch-add each item with vector=item["vector"]
-    # TODO: flush the batch
-    # TODO: query the aggregate count and return it
-    raise NotImplementedError("ingest_corpus is not yet implemented")
+    # 2. Batch ingest
+    with client.batch as batch:
+        batch.batch_size = 20
+        for item in items:
+            data_object = {
+                "title": item["title"],
+                "text": item["text"]
+            }
+            # Ensure vector is Python list
+            vector = item["vector"]
+            if isinstance(vector, np.ndarray):
+                vector = vector.tolist()
+
+            batch.add_data_object(
+                data_object=data_object,
+                class_name=class_name,
+                vector=vector,
+                uuid=str(uuid.uuid4())
+            )
+
+    # 3. Get final count
+    result = (
+        client.query
+        .aggregate(class_name)
+        .with_meta_count()
+        .do()
+    )
+    
+    count = result.get("data", {}).get("Aggregate", {}).get(class_name, [{}])[0].get("meta", {}).get("count", 0)
+    return int(count)
